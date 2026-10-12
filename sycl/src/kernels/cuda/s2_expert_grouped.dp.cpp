@@ -15,6 +15,7 @@
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include "strata/spill_dispatch.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
@@ -1418,6 +1419,83 @@ __dpct_inline__ void gu_grouped_t_kernel(
     }
 }
 
+// Retain packed code words across entries, not expanded byte fields.
+__dpct_inline__ void gu_grouped_t_packed_kernel(
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_tok, const uint8_t *__restrict__ x_q8_0,
+    const float *__restrict__ x_scales, float *__restrict__ gate_up,
+    int cap_entries) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int NC = H / 32;
+    auto &xs_w = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        int[8 * GMAX * NC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<
+            3>()); // 20 KB: word j of entry k's chunk c at [j][k * NC + c]
+    auto &xs_dh = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        sycl::int2[GMAX * NC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>()); // 5 KB: (dx as
+                                                                 // bits, hx)
+    const int g = item_ct1.get_group(1);
+    if (g >= *n_groups) return;
+    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    for (int i = t; i < ne * NC; i += item_ct1.get_local_range(2)) {
+        const int k = i / NC, c = i - k * NC;
+        const int tok = ent_tok[e0 + k];
+        const uint8_t* xb = x_q8_0 + (size_t) tok * (size_t) NC * 34 + (size_t) c * 34;
+        const float dx = x_scales ? x_scales[(size_t) tok * NC + c] : f16_ld(xb);
+        stage_chunk<GMAX * NC>(xb, dx, xs_w, xs_dh, i);
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int row0 = item_ct1.get_group(2) *
+                     GU_ROWS; // even: a pair is always (gate r, up r)
+    for (int pp = warp; pp < GU_ROWS / 2; pp += 8) {
+        const int i = row0 + 2 * pp;
+        const uint8_t* codes = blob + (size_t) i * ROW_GU;
+        const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
+        sycl::uint2 packed0[GU_CHUNKS], packed1[GU_CHUNKS];
+        float dw0[GU_CHUNKS], dw1[GU_CHUNKS];
+#pragma unroll
+        for (int q = 0; q < GU_CHUNKS; ++q) {
+            const int c = lane + 32 * q;
+            if (c < NC) {
+                packed0[q] = *(const sycl::uint2 *)(codes + (size_t)c * 8);
+                packed1[q] = *(const sycl::uint2 *)(codes + ROW_GU + (size_t)c * 8);
+                dw0[q] = f16_ld(scales + (size_t) (c >> 1) * 2);
+                dw1[q] = f16_ld(scales + SC_GU * 2 + (size_t) (c >> 1) * 2);
+            }
+        }
+        for (int k = 0; k < ne; ++k) {
+            float acc0 = 0.0f, acc1 = 0.0f;
+#pragma unroll
+            for (int q = 0; q < GU_CHUNKS; ++q) {
+                const int c = lane + 32 * q;
+                if (c >= NC) break;
+                const int at = k * NC + c;
+                int m0q[8], m1q[8];
+                expand_codes(packed0[q], m0q);
+                expand_codes(packed1[q], m1q);
+                int X[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) X[j] = xs_w[j * (GMAX * NC) + at];
+                const sycl::int2 dh = xs_dh[at];
+                const float dx = sycl::bit_cast<float>(dh.x());
+                acc0 += dw0[q] * dx * (float)(chunk_s(m0q, X) - dh.y());
+                acc1 += dw1[q] * dx * (float)(chunk_s(m1q, X) - dh.y());
+            }
+            const float s0 = warp_sum(acc0);
+            const float s1 = warp_sum(acc1);
+            if (lane == 0) {
+                const int e = e0 + k, r = i >> 1;
+                gate_up[(size_t) e * FF + (size_t) r] = s0;
+                gate_up[(size_t) cap_entries * FF + (size_t) e * FF + (size_t) r] = s1;
+            }
+        }
+    }
+}
+
 /*
 DPCT1110: The total declared local variable size in device function
 down_grouped_t_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1593,14 +1671,22 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<
-                dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
+            // A770 port: gu_grouped_t_packed_kernel keeps each lane's code words packed across the group's entries
+            // (the expanded byte fields spilled), same bits (s2_expert_grouped_parity --spill-only), in large-GRF
+            // mode.  Default on Alchemist only; STRATA_SPILL_FREE=0|1 forces it (spill_dispatch.hpp).
+            strata::spill_parallel_for<dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(*cs,
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
                         gu_grouped_t_kernel(grp_ptr, grp_start, n_groups,
+                                            ent_tok, x_q8_0, x_scales, gate_up,
+                                            (int)cap_entries);
+                    },
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gu_grouped_t_packed_kernel(grp_ptr, grp_start, n_groups,
                                             ent_tok, x_q8_0, x_scales, gate_up,
                                             (int)cap_entries);
                     });

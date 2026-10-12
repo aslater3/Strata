@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include "strata/spill_dispatch.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -2764,9 +2765,10 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class route_kernel_4c3133,
-                                            dpct_kernel_scalar<8>>>(
+        // A770 port: the Coder's 256-expert router in large-GRF mode on Alchemist (it spilled; same body, same bits).
+        // STRATA_SPILL_FREE=0|1 forces it off or on (spill_dispatch.hpp).
+        strata::spill_parallel_for<dpct_kernel_name<class route_kernel_4c3133,
+                                            dpct_kernel_scalar<8>>>(*strata::q_of(stream),
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((T + 7) / 8)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

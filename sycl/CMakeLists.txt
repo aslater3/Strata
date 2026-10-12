@@ -315,6 +315,17 @@ if(STRATA_SYCL_PARITY)
   add_executable(s2_expert_grouped_parity ${_src})
   target_link_libraries(s2_expert_grouped_parity PRIVATE strata_kernels)
   add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
+  # A770 port: the spill-free kernel variants (include/strata/spill_dispatch.hpp) against the previous ones in one
+  # process, STRATA_SPILL_FREE=0 vs 1, bitwise: grouped gate/up, the routers (decode and prompt) and the QSA top-k
+  add_test(NAME s2_expert_grouped_spill_parity COMMAND s2_expert_grouped_parity --selftest --spill-only)
+  strata_resolve(_src src/kernels/router_spill_parity.cpp)
+  add_executable(router_spill_parity ${_src})
+  target_link_libraries(router_spill_parity PRIVATE strata_kernels strata_prefill)   # strata::prefill::route
+  add_test(NAME router_spill_parity COMMAND router_spill_parity)
+  strata_resolve(_src src/kernels/qsa_spill_parity.cpp)
+  add_executable(qsa_spill_parity ${_src})
+  target_link_libraries(qsa_spill_parity PRIVATE strata_kernels)
+  add_test(NAME qsa_spill_parity COMMAND qsa_spill_parity)
   # upstream PR #363: native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the v1 launches
   strata_resolve(_src src/kernels/native_grouped_parity.cpp)
   add_executable(native_grouped_parity ${_src})

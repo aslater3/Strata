@@ -3,6 +3,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/spill_dispatch.hpp"
 #include "strata/core/emulate.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -1108,6 +1109,160 @@ auto &hist =
 #endif
 
 
+// Spill-bounded variant: reload keys from the score row, and do not unroll
+// the serial digit walk or variable-length emit. All selection arithmetic is integer.
+template <int PER>
+/*
+DPCT1110: The total declared local variable size in device function
+block_topk_stream_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void block_topk_stream_kernel(const float *__restrict__ scores,
+                                           const int32_t *__restrict__ steps,
+                                           int64_t max_blocks, int64_t cap,
+                                           int32_t *__restrict__ ids) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &hist =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<int[TK_T / 32][256]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_warp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[33]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_digit = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_above = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int64_t qi = item_ct1.get_group(2);
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    if (n_kv <= width) {
+#pragma unroll 1
+        for (int64_t j = t; j < n_kv; j += TK_T) out[j] = (int32_t)j;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int64_t nb = n_bid + 1;
+    const int64_t per = (nb + TK_T - 1) / TK_T;       // <= PER (the caller checks)
+    const int64_t b0 = (int64_t) t * per, b1 = (b0 + per < nb) ? b0 + per : nb;
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+    uint32_t prefix = 0;
+    int above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+#pragma unroll 1
+        for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+#pragma unroll 1
+        for (int j = 0; j < PER; ++j) {
+            const int64_t b = b0 + j;
+            if (b >= b1) break;
+            const int w = weight(b);
+            if (w == 0) continue;
+            if ((order_key(sc[b]) & hi_mask) == (prefix & hi_mask))
+                dpct::atomic_fetch_add<
+                    sycl::access::address_space::generic_space>(
+                    &hist[warp][(order_key(sc[b]) >> shift) & 255], w);
+        }
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier();
+        if (t < 256) {                                // fold the warps' histograms into warp 0's
+            int s = 0;
+#pragma unroll 1
+            for (int w2 = 0; w2 < TK_T / 32; ++w2) s += hist[w2][t];
+            hist[0][t] = s;
+        }
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier();
+        if (t == 0) {
+            int cum = above, d = 255;
+#pragma unroll 1
+            for (; d > 0; --d) {
+                if (cum + hist[0][d] >= width) break;
+                cum += hist[0][d];
+            }
+            s_digit = d;
+            s_above = cum;
+        }
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier();
+        prefix |= (uint32_t) s_digit << shift;
+        above = s_above;
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier();
+    }
+    const uint32_t thr = prefix;
+    const int64_t eq_budget = width - above;
+    int gt = 0, eq = 0;
+#pragma unroll 1
+    for (int j = 0; j < PER; ++j) {
+        const int64_t b = b0 + j;
+        if (b >= b1) break;
+        const int w = weight(b);
+        if (w == 0) continue;
+        if (order_key(sc[b]) > thr) gt += w;
+        else if (order_key(sc[b]) == thr) eq += w;
+    }
+    int tot;
+    const int eq_before = block_excl_scan(eq, s_warp, tot);
+    int64_t my_eq = eq_budget - eq_before;
+    if (my_eq < 0) my_eq = 0;
+    if (my_eq > eq) my_eq = eq;
+    const int sel = gt + (int) my_eq;
+    int64_t wpos = block_excl_scan(sel, s_warp, tot);
+    int64_t eq_left = my_eq;
+#pragma unroll 1
+    for (int j = 0; j < PER; ++j) {
+        const int64_t b = b0 + j;
+        if (b >= b1) break;
+        const int w = weight(b);
+        if (w == 0) continue;
+        if (order_key(sc[b]) > thr) {
+#pragma unroll 1
+            for (int c = 0; c < w; ++c) out[wpos++] = (int32_t)(b * R + c);
+        } else if (order_key(sc[b]) == thr) {
+#pragma unroll 1
+            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left)
+                out[wpos++] = (int32_t)(b * R + c);
+        }
+    }
+}
+
+
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
 // (max_blocks / 8) x nq: ~24,600 mostly-idle blocks per layer at a decode window, each key re-read per query).  A fixed
 // grid strides over the blocks; per (block, query) the same arithmetic in the same order as block_scores_kernel.
@@ -1999,6 +2154,19 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
+    }
+    // A770 port: the spill-bounded top-k (keys re-read from the score row, serial loops not unrolled) for every query
+    // the register kernel's widest variant holds; bit-identical ids (qsa_spill_parity).  The register kernel spilled
+    // 11.9 KB/thread on an A770; there QSA select at an 8K prompt went 220 -> 171 ms.  Default on Alchemist only;
+    // STRATA_SPILL_FREE=0|1 forces it off or on (spill_dispatch.hpp).
+    if (strata::spill_free(*strata::q_of(stream)) && reach <= (int64_t) TK_T * TK_PER_MAX) {
+        strata::q_of(stream)->parallel_for<class BlockTopkStream>(
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq * TK_T),
+                              sycl::range(1, 1, TK_T)),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                block_topk_stream_kernel<TK_PER_MAX>(scores, steps, max_blocks, cap, ids);
+            });
+        return;
     }
 #if !defined(__HIPCC__)
     // Turing prefill (the `counted` bound) above ~90K cells (22,528 blocks): the wide kernel, which reads the keys

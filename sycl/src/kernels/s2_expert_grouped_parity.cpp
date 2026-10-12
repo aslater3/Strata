@@ -55,6 +55,15 @@ static_assert(BLOB == 1382400, "the Q2_0 expert blob is 1,382,400 bytes");
 constexpr size_t XROW = (size_t) NCH_GU * 34;   // one token's activation row of block_q8_0
 
 int g_fail = 0;
+bool g_spill_only = false;   // --spill-only: STRATA_SPILL_FREE=0 vs 1 (spill_dispatch.hpp) on the same grouped kernels
+
+void spill_free(bool on) {
+#ifdef _WIN32
+    _putenv_s("STRATA_SPILL_FREE", on ? "1" : "0");
+#else
+    setenv("STRATA_SPILL_FREE", on ? "1" : "0", 1);
+#endif
+}
 
 void ck(dpct::err0 e, const char *w) {
     /*
@@ -177,11 +186,13 @@ bool twice(const char* name, float* d_out, size_t out_floats, const Scratch& s,
         ck(DPCT_CHECK_ERROR(
                (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(s.p, 0x5A, s.bytes).wait()),
            "sentinel scratch");
-        k::moe_grouped_select_old(old);
+        // --spill-only keeps the new grouped kernels in both runs and switches only their spill-free variant
+        k::moe_grouped_select_old(g_spill_only ? 0 : old);
+        if (g_spill_only) spill_free(!old);
         (void) k::moe_grouped_last_path();   // clear
         call();
         const int path = k::moe_grouped_last_path();
-        const int want = old ? 0 : (expect_new ? 1 : 0);
+        const int want = !g_spill_only && old ? 0 : (expect_new ? 1 : 0);
         if (path != want) {
             std::printf("  %-44s forced %s: launched %s kernels, expected %s\n", name, old ? "previous" : "new",
                         path == 1 ? "the new" : path == 0 ? "the previous" : "no", want ? "the new" : "the previous");
@@ -777,12 +788,14 @@ int main(int argc, char** argv) {
     bool do_bench = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
+        else if (std::strcmp(argv[i], "--spill-only") == 0) g_spill_only = true;
         else if (std::strcmp(argv[i], "--selftest") != 0) {
-            std::fprintf(stderr, "usage: s2_expert_grouped_parity [--selftest] [--bench]\n");
+            std::fprintf(stderr, "usage: s2_expert_grouped_parity [--selftest] [--bench] [--spill-only]\n");
             return 2;
         }
     }
-    std::printf("s2_expert_grouped_parity: new expert kernels vs the previous ones, bitwise\n");
+    std::printf("s2_expert_grouped_parity: %s, bitwise\n", g_spill_only ?
+        "STRATA_SPILL_FREE=0 vs 1 (the same grouped kernels)" : "new expert kernels vs the previous ones");
     check_all();
     if (do_bench) bench();
     std::printf("s2_expert_grouped_parity: %d failures\n%s\n", g_fail, g_fail ? "FAIL" : "PASS");

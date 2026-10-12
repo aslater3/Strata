@@ -22,6 +22,7 @@
 // SOFTWARE.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include "strata/spill_dispatch.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -67,7 +68,7 @@ exceeds 128 bytes and may cause high register pressure. Consult with your
 hardware vendor to find the total register size available and adjust the code,
 or use smaller sub-group size to avoid high register pressure.
 */
-template <int NE>   // SYCL port: 512 (canonical) or 256 (the Coder) experts, 32 lanes x NE/32 values
+template <int NE, bool SpillSafe = false>   // SYCL port: 512 (canonical) or 256 (the Coder) experts, 32 lanes x NE/32 values
 __dpct_inline__ void route(const float *__restrict__ logits,
                            int32_t *__restrict__ ids,
                            float *__restrict__ weights) {
@@ -130,7 +131,14 @@ __dpct_inline__ void route(const float *__restrict__ logits,
             if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
         }
         if ((expert & 31) == lane) {
-            values[expert / 32] = -INFINITY;
+            if constexpr (SpillSafe) {
+                // Constant field selection: never address a private array dynamically.
+#pragma unroll
+                for (int i = 0; i < NE / 32; ++i)
+                    if (expert == lane + i * 32) values[i] = -INFINITY;
+            } else {
+                values[expert / 32] = -INFINITY;
+            }
             ids[rank] = expert;
             // Deliberately accumulate by WINNING EXPERT lane, not output rank.
             // Multiple selected experts in one lane add in selection order.
@@ -236,13 +244,19 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class route_96e6fb>>(
+        // A770 port: route<NE, true> clears the winner's slot by constant index (the dynamic values[expert / 32]
+        // spilled the array to scratch), same bits (router_spill_parity), in large-GRF mode.  Default on Alchemist
+        // only, here and in the two multi-token launches below; STRATA_SPILL_FREE=0|1 forces it (spill_dispatch.hpp).
+        strata::spill_parallel_for<dpct_kernel_name<class route_96e6fb>>(*strata::q_of(stream),
                 sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
                         route<512>(logits, ids, weights);
+                    },
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        route<512, true>(logits, ids, weights);
                     });
     }
     /*
@@ -273,10 +287,11 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     // SYCL port: one block per token running the single-token route<512> (the same kernel as the 256-expert multi
     // launch below).  Upstream's one-warp-per-token route_multi gives the same bits (native_multi_parity checks
     // that) but hung an Arc A750 (Alchemist) on its first launch.
-    ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class route_512_multi>>(
+    strata::spill_parallel_for<dpct_kernel_name<class route_512_multi>>(*strata::q_of(stream),
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<512>(logits, ids, weights); });
+            sycl::ext::oneapi::experimental::properties{},
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<512>(logits, ids, weights); },
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<512, true>(logits, ids, weights); });
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You
@@ -304,9 +319,10 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
     if (!stream || n_tok < 1 || n_expert != 256 || !valid(logits, (size_t) n_tok * 256 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi, 256): a stream, 256 experts and aligned [n,256]/[n,10] buffers");
-    ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class route_256_multi>>(
+    strata::spill_parallel_for<dpct_kernel_name<class route_256_multi>>(*strata::q_of(stream),
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
+            sycl::ext::oneapi::experimental::properties{},
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); },
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256, true>(logits, ids, weights); });
 }
 }
