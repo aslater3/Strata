@@ -700,6 +700,10 @@ struct Prefill::Impl {
     bool fused_bufs = false;
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     dpct::event_ptr copied[RING_MAX] = {}, used[RING_MAX] = {};
+    // The issuer thread (threaded_issue) copies used[used_of[sl]] - a sycl::event, a shared pointer - while the launching
+    // thread reassigns used[] and used_of[]. Unguarded, a torn copy freed a live event and the Level Zero adapter aborted
+    // with "urEventWait must not be called for an internal event" (Arc A770, xe, 32K prompt, 6-8 stager threads).
+    std::mutex ev_mu;
     bool stage_live[RING_MAX] = {};
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
@@ -2578,8 +2582,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                if (m.stage_live[sl])(m.copy)->ext_oneapi_submit_barrier(
-                    {*m.used[m.used_of[sl]]});
+                if (m.stage_live[sl]) {
+                    sycl::event u;   // copied under ev_mu (see there)
+                    { std::lock_guard<std::mutex> ev_lk(m.ev_mu); u = *m.used[m.used_of[sl]]; }
+                    m.copy->ext_oneapi_submit_barrier({u});
+                }
                 if (en.job < 0) {
                     /*
                     DPCT1124: cudaMemcpyAsync is migrated to asynchronous
@@ -2646,8 +2653,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                    if (m.stage_live[sl])(m.copy)->ext_oneapi_submit_barrier(
-                        {*m.used[m.used_of[sl]]});
+                    if (m.stage_live[sl]) {
+                        sycl::event u;   // copied under ev_mu (see there)
+                        { std::lock_guard<std::mutex> ev_lk(m.ev_mu); u = *m.used[m.used_of[sl]]; }
+                        m.copy->ext_oneapi_submit_barrier({u});
+                    }
                     if (en.job < 0) {
                         /*
                         DPCT1124: cudaMemcpyAsync is migrated to
@@ -3298,9 +3308,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
                             for (size_t kk = k0; kk < k; ++kk) {
-                                dpct::sync_barrier(m.used[kk % (size_t)m.ring],
-                                                   m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                                {
+                                    std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                    dpct::sync_barrier(m.used[kk % (size_t)m.ring], m.cs);
+                                    m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                                }
                             }
                             if (k > k0) {
                                 consumed = k;
@@ -3841,9 +3853,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                                if (m.stage_live[sl])(m.copy)
-                                    ->ext_oneapi_submit_barrier(
-                                        {*m.used[m.used_of[sl]]});
+                                if (m.stage_live[sl]) {
+                                    sycl::event u;   // copied under ev_mu (see there)
+                                    { std::lock_guard<std::mutex> ev_lk(m.ev_mu); u = *m.used[m.used_of[sl]]; }
+                                    m.copy->ext_oneapi_submit_barrier({u});
+                                }
                                 /*
                                 DPCT1124: cudaMemcpyAsync is migrated to
                                 asynchronous memcpy API. While the origin API
@@ -3858,9 +3872,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
-                                if (m.stage_live[sl])(m.copy)
-                                    ->ext_oneapi_submit_barrier(
-                                        {*m.used[m.used_of[sl]]});
+                                if (m.stage_live[sl]) {
+                                    sycl::event u;   // copied under ev_mu (see there)
+                                    { std::lock_guard<std::mutex> ev_lk(m.ev_mu); u = *m.used[m.used_of[sl]]; }
+                                    m.copy->ext_oneapi_submit_barrier({u});
+                                }
                                 /*
                                 DPCT1124: cudaMemcpyAsync is migrated to
                                 asynchronous memcpy API. While the origin API
@@ -3923,8 +3939,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             if (gg_nslots > 0) {
                                 const int rel = gg_slots[gg_nslots - 1];
-                                dpct::sync_barrier(m.used[rel], m.cs);
-                                for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                {
+                                    std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                    dpct::sync_barrier(m.used[rel], m.cs);
+                                    for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                }
                             }
                             gg_nslots = 0;
                             gg.first = gg.n;
@@ -4006,8 +4025,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             if (xg_ns > 0) {
                                 const int rel = xg_slots[xg_ns - 1];
-                                dpct::sync_barrier(m.used[rel], m.cs);
-                                for (int i = 0; i < xg_ns; ++i) m.used_of[xg_slots[i]] = rel;
+                                {
+                                    std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                    dpct::sync_barrier(m.used[rel], m.cs);
+                                    for (int i = 0; i < xg_ns; ++i) m.used_of[xg_slots[i]] = rel;
+                                }
                             }
                             xg_n = 0;
                             xg_ns = 0;
@@ -4037,8 +4059,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
                                 if (slot >= 0 && !group_gather) {
-                                    dpct::sync_barrier(m.used[slot], m.cs);
-                                    m.used_of[slot] = slot;
+                                    {
+                                        std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                        dpct::sync_barrier(m.used[slot], m.cs);
+                                        m.used_of[slot] = slot;
+                                    }
                                 }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
@@ -4101,8 +4126,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
                             if (slot >= 0) {
-                                dpct::sync_barrier(m.used[slot], m.cs);
-                                m.used_of[slot] = slot;
+                                {
+                                    std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                    dpct::sync_barrier(m.used[slot], m.cs);
+                                    m.used_of[slot] = slot;
+                                }
                             }
                             if (xmx_on) {
                                 if (static bool said = false; !said) {
@@ -4186,8 +4214,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     if (gg_nslots > 0) flush();   // the open group's slots get their event first
                                     if (xg_n > 0) xflush();   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    dpct::sync_barrier(m.used[sl], m.cs);
-                                    m.used_of[sl] = sl;
+                                    {
+                                        std::lock_guard<std::mutex> ev_lk(m.ev_mu);   // see ev_mu
+                                        dpct::sync_barrier(m.used[sl], m.cs);
+                                        m.used_of[sl] = sl;
+                                    }
                                     consumed = ++k;
                                     give_back(consumed);
                                 }
