@@ -124,3 +124,37 @@ part of it is hidden behind the per-segment overhead, so this comes after B.
 
 Likelihood of breaking other platforms with this sequence: low (opt-in, SYCL-only, additive, self-tested). The real
 risk is that B does not pay: Phase 0 decides that before the bulk of the work.
+
+## 7. The architecture, measured (2026-10-14)
+
+Where the A770 time goes once every measured structural alternative is tried. Coder IQ1_M, 128K, `--resident-experts`,
+service headroom (4 GiB), v0.1.44.1 + #2207 + #2215.
+
+**What was architecturally wrong, and is fixed** (`a770/up-resident-chunked`): the RAM-resident expert copy. The CUDA
+engine registers it (`cudaHostRegister`); the SYCL port could not (DPCT1027) and DG2 refuses one pinned allocation of
+>= 4 GiB, so the copy was pageable and the GPU copied from it at 2.4-4 GB/s through the host stager. Pinned in 2 GiB
+chunks: prompt experts 9,352/9,352 by DMA (was 0), host staging -95%, lent-slot refill -55%, tier swaps -78%,
+prompt +1.5%, decode +0.5-1.3%, identical ids. (Registering the pageable copy with `prepare_for_device_copy` instead
+works in a probe at 18 GiB but failed in the engine above 4-10 GiB with `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the
+adapter's pool; rejected.)
+
+**Prompt (12 s for 8K): GPU-bound, and the cost is the MoE dispatch structure.** The compute engine is 93-96% busy;
+the host thread waits on oneMKL's copy-based FP16 GEMM driver (synchronous: `mkl_blas_gpu_pool_complete_request_usm`
+-> `urEventWait`, 82% of its waiting, all from the dense projections), which costs no GPU idle. The expert path is
+~5.7 s of 11.9: ~12,300 per-expert oneMKL calls + a staging copy per GEMM (oneMKL misreads operands > 4 GiB into an
+allocation on this card; the prompt path's buffers are borrowed from the cache arena past 4 GiB) + a separate
+dequant pass. A synthetic layer (`moe_layer_probe`, 256 experts, 79,866 uneven rows): engine-shaped 87 ms, without
+staging 77, without dequant 31, one GEMM pair over all rows 13.6 ms (57.8 TFLOPS; oneMKL peaks at 75-82 TFLOPS).
+**The fix is a grouped MoE GEMM** (all experts of a layer in one or two launches, dequant fused, operands where the
+oneMKL bug cannot reach): the expert path's ~5.7 s toward ~1.5 s, i.e. a prompt of ~12 s -> ~8 s (estimate). The
+existing grouped XMX prototype is short of it: `STRATA_PF_XMX=1` 710 tok/s (+4%), `=2` 658 (DG2 8x8x16 joint_matrix,
+untuned).
+
+**Decode (~100 ms/round, 2.8 tokens): the stepped window is the right structure; the limits are compute.** Measured
+and rejected: the single-graph window (20-23 tok/s, +35 ms/round GPU for an unexplained reason), `--spec-split` (two
+groups pipelined: 1.6 tok/s stepped, 17.4 single-graph), the GPU reading misses over PCIe from the pinned copy
+(`--pcie-frac` 0.2 / 0.35: 30.96 / 29.04 vs 31.30 tok/s; the GPU's PCIe reads cost more than the CPU time they save,
+as the RAM contention probe predicts), host-overhead removal in the stepped serve (hidden behind the CPU pool). What
+is left per round: the GPU's dense layers ~43 ms (~25% of VRAM bandwidth), the CPU's misses ~22-25 ms (within ~1.4x of
+the RAM limit), MTP ~11 ms, tier swaps ~1 ms after the fix. The decode levers are GPU kernel efficiency and the miss
+rate (VRAM for more cache slots), not the window architecture.
