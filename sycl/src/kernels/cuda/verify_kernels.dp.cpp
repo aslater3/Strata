@@ -2559,7 +2559,9 @@ struct ProfileHostClock {
         __atomic_store_n(word, profile_now_ns(), __ATOMIC_RELEASE);
         writer = std::thread([this] {
             while (!stop.load(std::memory_order_relaxed)) {
-                __atomic_store_n(word, profile_now_ns(), __ATOMIC_RELEASE);
+                const uint64_t ns = profile_now_ns();
+                __atomic_store_n(word, ns, __ATOMIC_RELEASE);
+                __atomic_store_n(reinterpret_cast<uint32_t*>(word) + 2, (uint32_t) (ns >> 4), __ATOMIC_RELEASE);
                 for (int i = 0; i < 8; ++i) __builtin_ia32_pause();
             }
         });
@@ -2584,9 +2586,12 @@ uint64_t* profile_clock_word(const sycl::queue& q) {
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     auto& q = *strata::q_of(stream);
     uint64_t* word = profile_clock_word(q);
+    // Phase 0 (A770): a 64-bit uncached-hint load of host USM read stale on DG2 (sycl/probe/a770); a 32-bit one after
+    // an acquire fence is fresh. The writer keeps ns/16 in the low word (word[1]), wrapping every ~68 s.
+    const uint32_t* lo = reinterpret_cast<const uint32_t*>(word) + 2;
     q.single_task([=] {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-        buf[i] = strata::sys_load_mapped(word);
+        buf[i] = (unsigned long long) strata::sys_load_mapped(lo);
     });
 }
 

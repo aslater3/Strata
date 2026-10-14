@@ -1,8 +1,12 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include <mutex>
+#include <functional>
+#include <condition_variable>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_doorbell.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -102,10 +106,94 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // helper thread (serial segments) for A/B runs.
 const bool g_stepped = env_on("STRATA_VERIFY_STEPPED");
 
+// Phase 0 (A770): STRATA_VERIFY_CRUMBS=1 - per-stage window timing without a device clock (DG2 has none). At each
+// stage stamp the GPU writes the stage id to host USM with an uncached-hint store (seen by the host mid-kernel in
+// ~4 us on an A770); a host thread timestamps each change and prints the time per stage and window every 16 windows.
+// Diagnostic only: adds a 1x1 kernel per stamp (~25 per layer).
+const bool g_crumbs = env_on("STRATA_VERIFY_CRUMBS");
+// Phase 0: STRATA_VERIFY_HOSTT=1 - where the host's part of a single-graph window's layer goes (host clock only)
+const bool g_hostt = env_on("STRATA_VERIFY_HOSTT");
+thread_local std::chrono::steady_clock::time_point g_t_plan;
+struct HostT { double ring = 0, payload = 0, to_plan = 0, plan_to_done = 0, tail = 0; uint64_t layers = 0, windows = 0;
+               double s_drain = 0, s_toA = 0, s_submit = 0, s_join = 0, s_copy = 0, s_rest = 0; uint64_t s_serves = 0, s_windows = 0; };
+HostT g_ht;
+struct Crumbs {
+    uint32_t* word = nullptr;
+    int per = 0;
+    int64_t layers = 0;
+    std::vector<double> dur;
+    std::vector<uint64_t> cnt;
+    std::thread th;
+    std::atomic<bool> stop{false};
+    static Crumbs& get() { static Crumbs c; return c; }
+    void start(int64_t n_layers, int kper) {
+        if (word != nullptr) return;
+        per = kper; layers = n_layers;
+        dur.assign((size_t) (n_layers + 1) * kper + 2, 0.0);
+        cnt.assign(dur.size(), 0);
+        word = sycl::malloc_host<uint32_t>(16, dpct::get_in_order_queue());
+        *(volatile uint32_t*) word = 0;
+        th = std::thread([this] {
+            using clk = std::chrono::steady_clock;
+            uint32_t last = 0;
+            auto tl = clk::now();
+            uint64_t windows = 0, printed = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const uint32_t v = *(volatile uint32_t*) word;
+                if (v == last) { _mm_pause(); continue; }
+                const auto t = clk::now();
+                if (v < dur.size()) { dur[v] += std::chrono::duration<double, std::milli>(t - tl).count(); ++cnt[v]; }
+                if (v == 1) ++windows;   // layer 0, stage 0: a window starts
+                tl = t; last = v;
+                if (windows >= printed + 16 && v == 1) { printed = windows; report(windows); }
+            }
+        });
+        th.detach();
+    }
+    void report(uint64_t windows) {
+        static const char* names[33] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
+                                        "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
+                                        "gate", "15", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB",
+                                        "PCIe grp", "waitCPU", "combine", "25", "head", "27", "28", "29", "30", "31", "32"};
+        std::fprintf(stderr, "strata crumbs: %llu windows, ms per window by stage (time from the previous stamp to this one, all layers)\n",
+                     (unsigned long long) windows);
+        double tot = 0;
+        for (int i = 0; i < per; ++i) {
+            double d = 0; uint64_t c = 0;
+            for (int64_t l = 0; l <= layers; ++l) { const size_t k = (size_t) (l * per + i + 1); if (k < dur.size()) { d += dur[k]; c += cnt[k]; } }
+            if (c == 0) continue;
+            tot += d;
+            std::fprintf(stderr, "  %-12s %8.3f ms/window  (%llu stamps)\n", names[i], d / (double) windows, (unsigned long long) c);
+        }
+        std::fprintf(stderr, "  %-12s %8.3f ms/window\n", "total", tot / (double) windows);
+    }
+};
+void crumb_emit(uint32_t id, dpct::queue_ptr q) {
+    uint32_t* w = Crumbs::get().word;
+    if (w == nullptr) return;
+    q->single_task([=] { strata::sys_store(w, id); });
+}
+
 // STRATA_PIPE_HELPER_SIBLING=1 (opt-in, stepped mode): the host thread is pinned to one logical CPU and a std::thread
 // inherits that mask, so the pipelined serve's pool helper and the main thread's flag-A wait share one CPU and the
 // early segment is mostly submitted only after the pool finished.  With this set the helper runs on the host CPU's SMT
 // sibling instead.  -1: keep the inherited mask (unset, not pinned to one CPU, or no sibling).
+// Phase 1 (A770): STRATA_STEP_HELPER=1 - the stepped window's pool runs on one persistent helper thread instead of a
+// new std::thread per layer (48 per window: ~74 us each from start to the plan on an A770 host, 2026-10-14).
+struct StepHelper {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::function<void()> job;
+    std::atomic<bool> busy{false};
+    bool quit = false;
+    std::thread th;
+    void start(int cpu);
+    void run(std::function<void()> f) {
+        { std::lock_guard<std::mutex> lk(mu); job = std::move(f); busy.store(true, std::memory_order_release); }
+        cv.notify_one();
+    }
+    void wait() { while (busy.load(std::memory_order_acquire)) _mm_pause(); }
+};
 int pipe_helper_cpu() {
 #if defined(__linux__)
     static const int cpu = [] {
@@ -148,6 +236,34 @@ int pipe_helper_cpu() {
     return -1;
 #endif
 }
+void StepHelper::start(int cpu) {
+    th = std::thread([this, cpu] {
+#if defined(__linux__)
+        if (cpu >= 0) { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu, &cs); (void) pthread_setaffinity_np(pthread_self(), sizeof cs, &cs); }
+#endif
+        for (;;) {
+            std::function<void()> f;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [this] { return quit || (bool) job; });
+                if (quit) return;
+                f = std::move(job); job = nullptr;
+            }
+            f();
+            busy.store(false, std::memory_order_release);
+        }
+    });
+    th.detach();
+}
+StepHelper& step_helper() {
+    static StepHelper* h = [] { auto* x = new StepHelper; x->start(pipe_helper_cpu()); return x; }();
+    return *h;
+}
+const bool g_step_helper = env_on("STRATA_STEP_HELPER");
+// Phase 1 (A770): STRATA_STEP_PRESUBMIT=1 - the split segment (flag-A wait, plan copy, VRAM hits) is submitted right
+// after the drain, before the pool builds the plan; its first kernel waits for flag A on the GPU (32-bit uncached-hint
+// loads, fresh on DG2: sycl/probe/a770), so the ~78 us graph submit overlaps the plan instead of following it.
+const bool g_step_presubmit = env_on("STRATA_STEP_PRESUBMIT");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
@@ -226,7 +342,16 @@ bool window_host_uncached() {
     return v;
 }
 
-bool mapped(size_t bytes, void **h, void **d) try {
+// Phase 1 (A770): STRATA_VERIFY_SPLIT_MAPPED=1 - in the single-graph window the 32-bit words the two sides signal
+// with (ring, flags) and the payload only the GPU writes are ordinary host USM: 32-bit uncached-hint loads and stores
+// see each other there in microseconds (sycl/probe/a770/flag_probe.cpp). The bulk data the host writes mid-window (the
+// plan, the CPU rows) stays BIAS_UNCACHED: a running DG2 kernel reads ordinary host USM stale after its first read
+// (rows_probe.cpp).
+const bool g_split_mapped = env_on("STRATA_VERIFY_SPLIT_MAPPED");
+// Phase 0 bisect only (wrong results allowed): STRATA_VERIFY_SPLIT_DEBUG bits put more buffers in ordinary host USM:
+// 1 the plan, 2 the CPU rows, 4 the per-window inputs (tok, step, pos, commit, ple), 8 the output, 16 plan_err
+const int g_split_dbg = [] { const char* v = std::getenv("STRATA_VERIFY_SPLIT_DEBUG"); return v ? std::atoi(v) : 0; }();
+bool mapped(size_t bytes, void **h, void **d, bool gpu_writes = false) try {
     /*
     DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
     migrated code and was removed or replaced with 0. You may need to check the
@@ -234,7 +359,8 @@ bool mapped(size_t bytes, void **h, void **d) try {
     */
     // polled by the window's kernels: uncached host memory (sycl_queue.hpp); a buffer only read or written between
     // kernels (the stepped window's payload) is ordinary host USM
-    if (DPCT_CHECK_ERROR(*h = window_host_uncached() ? strata::host_malloc_polled(bytes, dpct::get_in_order_queue())
+    if (DPCT_CHECK_ERROR(*h = window_host_uncached() && !(gpu_writes && g_split_mapped)
+                                     ? strata::host_malloc_polled(bytes, dpct::get_in_order_queue())
                                      : sycl::malloc_host(bytes, dpct::get_in_order_queue())) !=
         0 || *h == nullptr) return false;
     std::memset(*h, 0, bytes);
@@ -523,21 +649,21 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
-    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
-              mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
-              mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
-              mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
-              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
-              mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
-              mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
-              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
-              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
-              mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_, g_split_dbg & 4) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_, g_split_dbg & 4) &&
+              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_, g_split_dbg & 4) &&
+              mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_, g_split_dbg & 4) &&
+              mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_, g_split_dbg & 4) &&
+              mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_, g_split_dbg & 8) &&
+              mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_, true) &&
+              mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_, true) &&
+              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_, true) &&
+              mapped(64, (void**) &h_seq_, (void**) &m_seq_, true) &&
+              mapped(64, (void**) &h_flag_, (void**) &m_flag_, true) &&
+              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_, true) &&
+              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_, true) &&
+              mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_, g_split_dbg & 16) &&
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_, g_split_dbg & 2);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -545,7 +671,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
         plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
-        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
+        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_, g_split_dbg & 1)) {
             err = "verify: mapped plan allocation failed";
             return false;
         }
@@ -819,6 +945,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
     static const bool eager = std::getenv("STRATA_VERIFY_EAGER") != nullptr;
     auto stamp = [&](int64_t l, int i, int grp) {
+        if (g_crumbs && grp == 0) { Crumbs::get().start(g.n_layers, kProfPer); crumb_emit((uint32_t) (l * kProfPer + i + 1), cs); }
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
         if (!prof_on_ || grp != 0) return;
         if (eager) { cs->wait(); prof_h_[(size_t) (l * kProfPer + i)] = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
@@ -1959,8 +2086,8 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
     // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
     // contributes nothing.
-    const auto gap = [](unsigned long long to, unsigned long long from) {
-        return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
+    const auto gap = [](unsigned long long to, unsigned long long from) {   // Phase 0: 32-bit ns/16 stamps
+        return (from != 0 && to != 0) ? (double) (uint32_t) ((uint32_t) to - (uint32_t) from) * 16.0 : 0.0;
     };
     // only this stage's layers [lb_, le_) are ever stamped (a layer split); the head only on the last stage
     for (int64_t l = lb_; l < le_; ++l) {
@@ -1968,8 +2095,10 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
         unsigned long long prev = at(l, 0);
         for (int i = 1; i <= 24; ++i) {
             const unsigned long long x = at(l, i);
-            if (x == 0 || x < prev) continue;
-            prof_sum_[kind][i] += (double) (x - prev);
+            if (x == 0 || prev == 0) { if (x) prev = x; continue; }
+            const uint32_t dlt = (uint32_t) x - (uint32_t) prev;
+            if (dlt > 0x40000000u) continue;   // out of order
+            prof_sum_[kind][i] += (double) dlt * 16.0;
             prev = x;
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
@@ -2088,7 +2217,28 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             // segment nxt ends at a split point: it is the plan copy + VRAM groups, whose only host wait is flag A
             const bool split = nxt < seg_kind_[T].size() && seg_kind_[T][nxt] == 0;
             static const bool pipe = [] { const char* e = std::getenv("STRATA_VERIFY_PIPE"); return !(e && e[0] == '0'); }();
-            if (pipe && split) {
+            if (pipe && split && (g_step_helper || g_step_presubmit)) {
+                std::atomic<bool> done{false};
+                std::string herr;
+                try {
+                    if (g_step_presubmit) { cs_->ext_oneapi_graph(*seg_[T][nxt]); submitted[nxt] = 1; }   // waits for A on the GPU
+                    auto job = [&]() { try { run_pool(); } catch (const std::exception& e) { herr = e.what(); } done.store(true, std::memory_order_release); };
+                    std::thread th;
+                    if (g_step_helper) step_helper().run(job); else th = std::thread(job);
+                    while (!done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want)
+                        _mm_pause();
+                    const Clock::time_point tA = Clock::now();
+                    if (done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want) empty_plan();
+                    if (!g_step_presubmit) { cs_->ext_oneapi_graph(*seg_[T][nxt]); submitted[nxt] = 1; }   // flag A is up
+                    const Clock::time_point tS = Clock::now();
+                    if (g_step_helper) step_helper().wait(); else th.join();
+                    if (g_hostt) {
+                        auto ms = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+                        g_ht.s_toA += ms(b, tA); g_ht.s_submit += ms(tA, tS); g_ht.s_join += ms(tS, Clock::now());
+                    }
+                } catch (const std::exception& e) { err = std::string("verify: pipelined serve: ") + e.what(); return false; }
+                if (!herr.empty()) { err = "verify: pool: " + herr; return false; }
+            } else if (pipe && split) {
                 std::atomic<bool> done{false};
                 std::string herr;
                 try {
@@ -2107,10 +2257,16 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                     });
                     while (!done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want)
                         std::this_thread::yield();
+                    const Clock::time_point tA = Clock::now();
                     if (done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want) empty_plan();
                     cs_->ext_oneapi_graph(*seg_[T][nxt]);   // flag A is up: its waits pass
+                    const Clock::time_point tS = Clock::now();
                     submitted[nxt] = 1;
                     th.join();
+                    if (g_hostt) {
+                        auto ms = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+                        g_ht.s_toA += ms(b, tA); g_ht.s_submit += ms(tA, tS); g_ht.s_join += ms(tS, Clock::now());
+                    }
                 } catch (const std::exception& e) { err = std::string("verify: pipelined serve: ") + e.what(); return false; }
                 if (!herr.empty()) { err = "verify: pool: " + herr; return false; }
             } else {
@@ -2118,7 +2274,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (*(volatile uint32_t*) h_flagA_ != want) empty_plan();
             }
+            const Clock::time_point tc0 = Clock::now();
             copy_->wait();   // fetch_dma's copies and its flag-B host task
+            const Clock::time_point tc1 = Clock::now();
             std::atomic_thread_fence(std::memory_order_seq_cst);
             raise_flag(h_flagB_, want);
             if (want == 1 && do_ple) {   // layer 1's pre copies h_ple_ after layer 0's wait on the M flag
@@ -2132,6 +2290,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             st_wait += std::chrono::duration<double, std::milli>(b - a).count();
             st_pool += ms_since(b);
+            if (g_hostt) {
+                auto ms = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+                g_ht.s_drain += ms(a, b); g_ht.s_copy += ms(tc0, tc1); g_ht.s_rest += ms(tc1, Clock::now()); ++g_ht.s_serves;
+            }
             return true;
         };
         try {
@@ -2146,6 +2308,13 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         } catch (const std::exception& e) { err = std::string("verify (stepped): ") + e.what(); le = 1; }
         ms_wait += st_wait;
         ms_pool += st_pool;
+        if (g_hostt && ++g_ht.s_windows % 32 == 0) {
+            const double w = (double) g_ht.s_windows;
+            std::fprintf(stderr, "verify stepped host (ms/window over %llu windows, %llu serves): drain %.2f | pool start->plan %.2f | "
+                         "submit split segment %.2f | pool rest (join) %.2f | copy wait %.2f | flags+ple %.2f\n",
+                         (unsigned long long) g_ht.s_windows, (unsigned long long) g_ht.s_serves, g_ht.s_drain / w, g_ht.s_toA / w,
+                         g_ht.s_submit / w, g_ht.s_join / w, g_ht.s_copy / w, g_ht.s_rest / w);
+        }
         if (le != 0) return false;
     } else {
         le = (std::getenv("STRATA_VERIFY_EAGER") != nullptr)
@@ -2261,6 +2430,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
         progress_at("verify window: the CPU experts of layer", l);
+        const Clock::time_point t_pay = Clock::now();
+        if (g_hostt) g_t_plan = t_pay;
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
@@ -2293,9 +2464,21 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             _mm_sfence();
             ms_host += ms_since(tp);
         }
+        const Clock::time_point t_pool = Clock::now();
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (g_hostt) {
+            auto ms = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+            g_ht.ring += ms(a, b); g_ht.payload += ms(b, t_pay); g_ht.to_plan += ms(t_pay, g_t_plan);
+            g_ht.plan_to_done += ms(g_t_plan, t_pool); g_ht.tail += ms(t_pool, Clock::now()); ++g_ht.layers;
+        }
+    }
+    if (g_hostt && ++g_ht.windows % 32 == 0) {
+        const double w = (double) g_ht.windows;
+        std::fprintf(stderr, "verify host (ms/window over %llu windows, %llu layer serves): GPU to ring %.2f | payload check %.2f | "
+                     "ring->plan published %.2f | plan->CPU rows done %.2f | flag %.2f\n", (unsigned long long) g_ht.windows,
+                     (unsigned long long) g_ht.layers, g_ht.ring / w, g_ht.payload / w, g_ht.to_plan / w, g_ht.plan_to_done / w, g_ht.tail / w);
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -2400,7 +2583,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     }
     if (prof_on_ && G == 1) {   // the window's GPU stage stamps
         collect_profile();
-        if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // SYCL port: the stage table per window, host-clocked
+        if (prof_windows_ >= 32)   // Phase 0: the table every 32 windows in any mode
+            std::fprintf(stderr, "verify stages T=%d (ms/window):%s\n", T, profile_report().c_str());
+        else if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // SYCL port: the stage table per window, host-clocked
             std::fprintf(stderr, "verify stages T=%d (ms/window):%s\n", T, profile_report().c_str());
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -2551,6 +2736,7 @@ void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    if (g_hostt) g_t_plan = std::chrono::steady_clock::now();
 }
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,

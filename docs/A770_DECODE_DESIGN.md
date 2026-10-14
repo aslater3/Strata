@@ -124,3 +124,34 @@ part of it is hidden behind the per-segment overhead, so this comes after B.
 
 Likelihood of breaking other platforms with this sequence: low (opt-in, SYCL-only, additive, self-tested). The real
 risk is that B does not pay: Phase 0 decides that before the bulk of the work.
+
+## 6. Phase 0 result (2026-10-14): the window structure is not the limit
+
+Measured on branch `a770/phase0-crumbs` (diagnostics only: `STRATA_VERIFY_HOSTT`, a 32-bit clock read for
+`STRATA_VERIFY_PROFILE`, and the switches below), Coder IQ1_M, 8K prompt, 256 tokens, unprofiled unless noted.
+
+- **Single-graph window host side** (`STRATA_VERIFY_HOSTT=1`): GPU to ring 79.4-79.9 ms/window, payload check 0.01,
+  ring -> plan published 0.13, plan -> CPU rows done 37.4, flag 0.00. The host reacts in microseconds; the GPU's part
+  between the CPU rows and the next ring is ~79 ms against ~43.5 ms of drain in the stepped window.
+- **Ruled out as the cause of those ~35 ms** (each measured, no change to GPU-to-ring 79 ms or decode ~20 tok/s):
+  ordinary host USM instead of BIAS_UNCACHED for the ring and payload (`STRATA_VERIFY_SPLIT_MAPPED`), also for the
+  flags, also for the plan, the CPU rows, the inputs, the output (bisect masks 1/2/4/8/16; all of them at once reads
+  stale data and crashes); plain payload stores (`STRATA_DOORBELL_PLAIN=1`); the shared-expert fork
+  (`STRATA_SH_STREAM=0`); the compute timeslice (1 ms -> 100 ms); the GPU clock (min = max = 2,400 MHz); graph size
+  (1,920 kernels in one graph cost 2.65 us/node against 3.42 in 97 drained segments, 6.65 vs 7.89 with 1.2 KB
+  arguments); host polling (`_mm_pause` spin, no sleep). The fixed stage profiler (inflating) shows pure GPU stages
+  2-40x slower in the single graph (QSA kv append 0.44 -> 18 ms, attention 1.6 -> 8.4, shared 4.5 -> 12); the cause is
+  still unknown.
+- **Stepped window host side** (`STRATA_VERIFY_HOSTT=1`): drain 43.5, pool start -> plan 3.5-4.7 (a new thread per
+  layer), split-segment submit 3.8 (~78 us each), pool 37.3, copy wait 0.07 ms/window. A persistent helper thread
+  (`STRATA_STEP_HELPER=1`) and submitting the split segment before the plan with a GPU-side flag-A wait
+  (`STRATA_STEP_PRESUBMIT=1`) remove those 7-8 ms from the serve, but decode is unchanged (25.15 / 24.75 / 24.91 tok/s):
+  they ran in parallel with the CPU pool, which is the critical path. Presubmit alone (with a new thread per layer)
+  collapses to 12.2 tok/s and is not usable.
+
+**Conclusion.** Each layer is GPU dense work -> CPU misses (with the VRAM hits overlapped) -> GPU combine, and both
+windows pay that chain; the stepped window's launch and sync overheads are already hidden behind the CPU pool. A
+single-graph window does not have decode to win on this machine (and is ~35 ms/round slower today for an unexplained
+reason). Plan B is closed. The levers left are the two sides' compute: the GPU's dense kernels (~43 ms/round of
+drain) and the CPU pool (~37 ms/round, of which ~10 ms is job building + prefetch before any row is computed) - plan
+A and C above, and the miss rate (VRAM for more cache slots, the profile).
