@@ -158,3 +158,32 @@ as the RAM contention probe predicts), host-overhead removal in the stepped serv
 is left per round: the GPU's dense layers ~43 ms (~25% of VRAM bandwidth), the CPU's misses ~22-25 ms (within ~1.4x of
 the RAM limit), MTP ~11 ms, tier swaps ~1 ms after the fix. The decode levers are GPU kernel efficiency and the miss
 rate (VRAM for more cache slots), not the window architecture.
+
+## 8. Prompt: the expert cache in segments (2026-10-14)
+
+The prompt path borrows the top expert-cache slots (5.4-7.6 GiB into the ~8.6 GiB arena), and oneMKL's GEMM misreads an
+operand more than 4 GiB into one allocation, so `staged_gemm` copied nearly every expert GEMM operand first: 24,576 staged
+GEMMs in an 8K prompt, 123 GB of W and 76 GB of X copied (`STRATA_SYCL_STAGE_STATS`, diagnostic, not kept).  Running
+direct and staged side by side in the engine (`STRATA_SYCL_GEMM_VERIFY`, diagnostic) reproduced the misread for the
+dense prompt GEMMs at T = 7987, and `gemm_far_probe` placed it: ONE allocation only.  The same GEMMs in physical
+segments behind one reserved address range read right at any offset.
+
+Change (`strata::malloc_device_segmented`, `sycl_queue.hpp`; `ExpertCache::open`): on Alchemist the arena is 512 MiB
+segments behind one range (`STRATA_ARENA_SEGMENTED=0`: one allocation as before, `=1`: other devices too) and is not
+registered for staging.  Level Zero refused a smaller last segment, so the segments are equal and of whole 2 MiB pages.
+A copy kernel in place of the staging memcpy gained nothing (bandwidth, not engine switches).
+
+Same-day A/B, deployed config (`STRATA_PF_XMX=2`, resident RAM, learned24), segmented vs `STRATA_ARENA_SEGMENTED=0`:
+
+| prompt | prefill seg | prefill one | decode seg | decode one | output |
+|---|---|---|---|---|---|
+| 8K #1 | 726.0 | 657.3 | 32.57 | 32.52 | identical |
+| 8K #2 | 730.8 | 656.8 | 32.36 | 32.46 | identical |
+| 32K #1 | 742.5 | 663.1 | 26.77 | 22.32 (outlier) | identical |
+| 32K #2 | 742.2 | 663.3 | 26.79 | 26.80 | identical |
+
+Prompt +11-12%, decode unchanged.  `STRATA_SYCL_GEMM_NO_STAGE=1`'s 1,122 tok/s was not a ceiling: its garbage
+activations collapsed the routing (365 experts streamed instead of 9,352).  The custom grouped XMX GEMM was measured too
+(`xmx_v`/`xmx_g` harnesses, 16 experts x 312 rows): SLM-tiled, double-buffered and direct-global variants with VNNI-packed
+B all plateau at 10-12 TFLOPS on DG2 (no 2D block loads), against 23 for per-expert oneMKL and 59 dense, so it is not the
+prompt's lever on this card; the remaining expert-GEMM gap (engine ~13 vs isolated 20-33 TFLOPS) is next.
