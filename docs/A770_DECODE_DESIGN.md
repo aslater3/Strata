@@ -274,3 +274,22 @@ vocab, kernel switches off): 8K prefill 654 / 656 -> 791 / 786 tok/s, decode 29.
 664 -> 794, decode 26.3 -> 29.6.  Remaining GPU levers: the hc reads (~106-137 us each, two a layer, ~125 GB/s), the
 dense GEMVs at 4 columns (180-240 GB/s). After the norm fold and the row-a-lane up kernel the hc read is 62 / 83 / 100
 us at 1 / 4 / 6 tokens (from 88 / 123 / 151 in the morning).
+
+## 12. GPU saturation: where the decode GPU idles (2026-10-14, night)
+
+unitrace device timing of a 2K-prompt decode (minus an 8-token run: decode only, ~62 rounds): ~55 ms of kernels in an
+~87 ms round; the rest is the GPU idle while the CPU computes the out-of-VRAM experts (~25 ms) and the segment gaps.
+Biggest kernels per round: the dense Q6_K wide GEMVs 8.6 ms (68.5 us a call, ~300 GB/s), the hc read 10 ms (down 63 +
+up 40 us a call in the engine), the GDN recurrence 6.7 ms (step 118 + commit 75 us), the VRAM-hit experts ~7 ms
+(beside the CPU), router / top-k / other GEMVs ~9 ms.
+
+- upstream's split GDN recurrence (`STRATA_GDN_SPLIT`, S25/S26, bitwise - gdn_parity 47 cases) is now the Alchemist
+  default: GPU wait 39.5 / 38.8 -> 37.6 / 37.9 ms a round.
+- `--vram-reserve-mib` (the cache's headroom): 300 / 800 MiB give 4,959 / 4,701 slots instead of 4,495 (hits 0.755 ->
+  0.79 / 0.78) and +3-4% decode at 8K, but at 32K the serves stall (VRAM too full: 15.4 / 26.7 against 31.9 / 28.9
+  tok/s). The 1200 default stays.
+- Benchmark hygiene: other jobs on this host (8 x `yes` under `timeout 420`, `test-feature-provenance`) cut the CPU
+  pool's row bandwidth from ~30 to 14-17 GB/s in some runs; `~/strata-probes/quiet.sh` now gates each bench.
+
+The GPU cannot be kept busy through the CPU's share while ~24% of the experts are out of VRAM: that share is the
+remaining structural idle, bounded by the card's 16 GB against ~27 GB of experts.

@@ -1839,7 +1839,13 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
+    // STRATA_GDN_SPLIT: also the default on Arc A-series (Alchemist): A770, 8K, the window's GPU wait 39.5 / 38.8 ->
+    // 37.6 / 37.9 ms a round (bitwise, as below); =0 / =1 choose
+    static const bool split = [] {
+        const char* v = std::getenv("STRATA_GDN_SPLIT");
+        if (v != nullptr) return v[0] == '1';
+        return strata::intel_gpu_gen(dpct::get_in_order_queue().get_device()) == strata::IntelGpuGen::Alchemist;
+    }();
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
     // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
