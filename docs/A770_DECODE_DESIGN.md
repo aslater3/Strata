@@ -187,3 +187,28 @@ activations collapsed the routing (365 experts streamed instead of 9,352).  The 
 (`xmx_v`/`xmx_g` harnesses, 16 experts x 312 rows): SLM-tiled, double-buffered and direct-global variants with VNNI-packed
 B all plateau at 10-12 TFLOPS on DG2 (no 2D block loads), against 23 for per-expert oneMKL and 59 dense, so it is not the
 prompt's lever on this card; the remaining expert-GEMM gap (engine ~13 vs isolated 20-33 TFLOPS) is next.
+
+## 9. Decode: where the GPU time goes, and pre-attention expert prefetch (2026-10-14)
+
+GPU-clocked stage table (Phase 0 clock, branch `a770/decode-prof`, T ~4, ms per window, stamps included): VRAM-hit
+experts 12.4, hc0 norm/down/up 7.3, shared + quant 5.9, the GEMVs (qkv, out-proj, z, ab) ~11, recurrence / attention /
+top-k / small kernels ~15. No single kernel dominates; the hit experts run at about a third of VRAM bandwidth and most
+small stages are launch-sized (8-12 us). fdinfo shows the compute engine ~99.5% busy all through decode (spin-waits
+included), so it cannot separate work from waiting.
+
+The serial part of a round is the CPU's out-of-VRAM experts (pool ~24.5 ms of ~85). A pre-attention prediction would
+let them be copied to VRAM during the layer's attention and computed as hits. `STRATA_PREDICT_PROBE=1` (diagnostic,
+`a770/decode-prof`) runs each layer's router on its attention input and compares with the real routing, per layer-window:
+
+| | value |
+|---|---|
+| distinct experts routed | 22.6 |
+| of them out of VRAM | 6.45 |
+| recall of those, predicted top-10 / 16 / 20 | 0.654 / 0.794 / 0.842 |
+| prefetches out of VRAM, top-10 / 16 / 20 | 8.8 / 15.2 / 19.7 experts (17 / 30 / 38 MB) |
+
+At top-10 the DMA is ~825 MB per round, ~48 ms at 17 GB/s: as long as the GPU part of the round, and sharing RAM
+bandwidth with the CPU's remaining misses. Estimate: ~85 -> 65-70 ms per round (+15-25% decode), bounded by the copy
+volume, not the recall. Cost: copies into the captured stepped graphs (graph copy nodes beside a spinning kernel gave
+DEVICE_LOST, section 7), device residency updates inside a window, prefetch slots. A multi-day engine feature; not
+started.
