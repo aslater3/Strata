@@ -1,0 +1,21 @@
+[Unit]
+Description=Strata (Qwen3.8-Flash-Next Coder) on the Arc A770, 128K context, OpenAI API on 127.0.0.1:8095
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+User=andy
+Group=andy
+SupplementaryGroups=render video
+WorkingDirectory=/home/andy/strata-a770
+# the engine locks its resident experts and pins KV/staging buffers (as the measured benchmark units did);
+# the user manager's 8 MiB memlock makes mlock fail
+LimitMEMLOCK=infinity
+Environment=HOME=/home/andy PYTHONUNBUFFERED=1
+ExecStart=/home/andy/strata-a770/.venv/bin/python serve/server.py --engine strata --config /home/andy/Strata-data/strata-a770-coder-next.json --port 8095
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
