@@ -12718,9 +12718,9 @@ int main(int argc, char **argv) try {
                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
                         (drive.cpu_ms - pool_ms0) / rounds);
         if (rounds > 0)
-            std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
+            std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f (prefetch %.3f)  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
-                        drive.d.ms_run / rounds);
+                        drive.d.ms_prefetch / rounds, drive.d.ms_run / rounds);
         if (usage_dev != nullptr) {   // STRATA_USAGE_DUMP: the window's routing as make_profile.py reads it (layer, k=1, id, weight)
             std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
             dpct::get_in_order_queue().memcpy(uh.data(), usage_dev, uh.size() * 4).wait();

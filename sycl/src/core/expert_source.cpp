@@ -2733,7 +2733,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
+        const auto cp = std::chrono::steady_clock::now();
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        d.ms_prefetch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cp).count();
     }
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
