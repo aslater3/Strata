@@ -1,0 +1,15 @@
+# DG2 (Arc A-series) memory and signalling probes
+
+Small standalone SYCL programs that measure what the verify window's design depends on, on an Arc A770 16 GB (`xe`).
+Results below: 2026-10-14, Ubuntu 26.04.1, Linux 7.0, compute runtime 26.05.37020.3, oneAPI DPC++ 2026.1, Ryzen 7 3800X,
+DDR4 dual channel, PCIe 4.0 x16. Run each with `memlock` unlimited; every GPU wait is bounded.
+
+Build: `icpx -fsycl -std=c++20 -O2 <file>.cpp -o <name>` (`-mavx2` for `contend_probe`, `-lze_loader` for `dataplane_probe`).
+
+| probe | question | result on the A770 |
+|---|---|---|
+| `pinned_probe` | pinned host allocation limits, GPU <-> RAM bandwidth | one `malloc_host` >= 4.00 GiB fails (also with `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`); 7 x 2 GiB chunks (14 GiB) work. A kernel reads pinned host memory at 17.3 GB/s (also across 4 chunks via a pointer table), VRAM at 427 GB/s; memcpy pinned->device 17.3, device->pinned 21.3, pageable->device 4.2 GB/s. `usm_atomic_host_allocations` and `usm_atomic_shared_allocations`: 0 |
+| `contend_probe <threads>` | do the GPU's zero-copy reads and the CPU's RAM reads add up? | No, they share the RAM: 4 threads: GPU 17.3 / CPU 41.9 GB/s alone, 17.0 + 19.3 = 36.3 GB/s together; 7 threads: 15.5 + 17.0 = 32.6; 14 threads: 13.5 + 14.4 = 27.9 |
+| `flag_probe dev\|host\|shared\|hostuc\|ping\|pingh\|pinguc` | can a running kernel be signalled, how fast is a handshake? | plain loads of host or shared USM never see a host store (timeout); a 32-bit load with the uncached read hint (after an acquire fence) sees it 9.2 us after the store; a device flag written by a memcpy on a second SYCL queue deadlocks behind the spinning kernel on the compute engine (`Engine reset: engine_class=ccs`, `DEVICE_LOST`); GPU->host with a plain store + system fence is seen only when the kernel ends; uncached-hint store out + uncached-hint load back: 2,000 of 2,000 round trips, 3.87 us each |
+| `rows_probe plain\|uc <rounds> <KiB> [rotate]` | is a block the host rewrites each round read fresh from ordinary host USM? | No: every block is read fresh once, then stale on every later round, with plain loads, uncached-hint 64-bit loads, a system acquire fence on every lane, and in a ring of 8 blocks |
+| `dataplane_probe bu\|ce\|ceuc <rounds> <KiB>` | the two remaining data planes | `bu` (BIAS_UNCACHED host USM, `zeMemAllocHost`): always fresh; the GPU reads it at ~2.3 GB/s in 256 KiB blocks, ~6.7 GB/s in 4 MiB blocks. `ce` (the copy engine, queue group 1, writes a VRAM block then a VRAM flag while the kernel spins): runs concurrently, no reset, but the block reads stale after the first round, also with uncached-hint 32/64-bit loads (`ceuc`) |
