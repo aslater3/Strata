@@ -37,6 +37,9 @@ export STRATA_STAGER_THREADS=${STRATA_STAGER_THREADS:-8}
 # DG2 refuses one device allocation above ~4 GiB unless relaxed: without it the expert cache is 1,906 slots, not 4,540
 # (decode 16.5-17.5 vs 24-27.6 tok/s at 8K, 2026-10-14). Safe on 0.1.44+ JIT builds (64-bit addresses past 4 GiB).
 export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=${UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS:-1}
+# the Level Zero v2 adapter: graph segments submit in ~25 us instead of 53-200 (A770, xe, oneAPI 2026.1): decode +7%,
+# prompt +3%, and the stepped window's run-to-run collapses (3x slower serves under memory pressure) gone in the A/B
+export UR_LOADER_USE_LEVEL_ZERO_V2=${UR_LOADER_USE_LEVEL_ZERO_V2:-1}
 [[ ${STRATA_A770_TIMING:-0} == 1 ]] && export STRATA_PREFILL_TIMING=1 || unset STRATA_PREFILL_TIMING   # +7% overhead and an internal-event abort on long prompts (opt in with STRATA_A770_TIMING=1 + STRATA_STAGER_THREADS=4)
 
 [[ $(ulimit -l) == unlimited ]] || echo "a770-strata: warning: memlock is $(ulimit -l) KiB, not unlimited (pinned host buffers may fall back)" >&2

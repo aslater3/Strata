@@ -243,3 +243,34 @@ than the CPU time it saves.  Not proposed upstream; off by default.
 **Decode status:** the measured candidates for an architectural decode change on the A770 - single-graph window,
 spec-split, PCIe zero-copy misses, pre-attention / next-layer VRAM prefetch - all lose.  What remains is per-kernel GPU
 efficiency (no kernel dominates; VRAM hits ~123 GB/s, launch-sized small stages) and a higher hit rate (more VRAM).
+
+## 11. Decode kernels and the runtime (2026-10-14, evening)
+
+Where the decode round's GPU time is on the critical path: the stepped window runs the VRAM-hit experts and the
+shared expert BESIDE the CPU pool (hidden while the pool is longer); the critical part is each layer's dense segment
+(hc reads, the qkv / z / out-proj / q GEMVs, the recurrence, attention, the combine) plus the segment submissions.
+
+| change | where | measured (A770, same day) | bits |
+|---|---|---|---|
+| large GRF for the grouped expert kernels (`STRATA_EXPERT_LARGE_GRF`, Alchemist default) | iq_kernels | `native_grouped_parity --bench2`: 218 -> 179 / 215 -> 197 / 280 -> 232 us a call; decode +1.3% (hidden behind the pool) | same |
+| the GR down reduce folded into the sliced down kernel (last slice of a row block reduces; `STRATA_GR_FUSED_REDUCE`) | fused_gr | gr_bench 1-6 tokens 88.4-150.8 -> 76.8-146.5 us | same (checksums) |
+| GR up kernel at 4 columns a block (`STRATA_GR_UP_MORE_COLS`) | fused_gr | gr_bench 4-6 tokens 111.3-146.7 -> 106.8-136.3 us | same |
+| the three together | | decode 33.64 / 33.41 -> 34.80 / 34.84 tok/s (+3.9%), ids identical | same |
+| the up kernel reads the lo values the fused reduce computes once (`STRATA_GR_LO_READY`) | fused_gr | gr_bench 4 / 6 tokens 106.7 -> 104.9, 137 -> 133 us | same |
+| the norm folded into the sliced down kernel (`STRATA_GR_NORM_FOLD`, Alchemist default): slices stage residual x w_norm unscaled + sums of squares, the reduce applies each stream's rs | fused_gr | gr_bench 1 / 4 / 6 tokens 74 -> 62, 105 -> 90, 134 -> 115 us | fp32 order (sums equal ~1e-7) |
+| the up projection one row a lane (`STRATA_GR_UP_V5`, Alchemist default): lo read as a local-memory broadcast instead of re-read per row (the old kernel was local-memory bound) | fused_gr | gr_bench 4 / 6 tokens 90.3 -> 83.3, 115.4 -> 100.5 us; 8 lanes a row (v4): slower | fp32 order |
+| norm fold + row-a-lane up, engine | | GPU wait 39.2-39.9 -> 38.1-39.2 ms/round at 8K / 32K / 2K; decode within noise (~+1%); output text equivalent, 2K ids identical | fp32 order |
+| Level Zero v2 adapter (`UR_LOADER_USE_LEVEL_ZERO_V2=1`, launcher default) | runtime | a graph segment submits in ~25 us instead of 53-200 (instrumented serve); GPU wait 43-48 -> 39.4-39.7 ms/round; decode +7%, prompt +3% (3 pairs 8K + 32K); the stepped window's 3x-slower outlier runs (5 of ~50 with v1) not seen with v2 | same kernels |
+| restricted draft vocabulary (`--mtp-draft-vocab data/draft_vocab_en.bin`, service config) | config | drafting 10.7 -> 7.5 ms/round; decode +5.5% (4 pairs); output coherent (greedy verification) | other window sizes |
+
+Measured and rejected: the existing lane / split knobs of the expert kernels (+-1%, split -38%), `use_root_sync`
+(no cost), a persistent pool helper thread (no difference under v2), the single-graph window under v2 (22 tok/s),
+`--spec-min-p` 0 / 0.3 / 0.7 and `--spec` 3 / 5 (all slower than spec 4 / min-p 0.5), all-80-in-flight reduce loads
+(spills), the up kernel's ILP variant (3x slower). The hc projections of this GGUF are BF16, so upstream's
+`STRATA_HC_Q8` (the GGUF's own Q8_0 bytes) does not apply.
+
+Cumulative, same day, against the morning's configuration (PF_XMX=2, one-allocation arena, v1 adapter, no draft
+vocab, kernel switches off): 8K prefill 654 / 656 -> 791 / 786 tok/s, decode 29.0 / 31.8 -> 33.8 / 35.2; 32K prefill
+664 -> 794, decode 26.3 -> 29.6.  Remaining GPU levers: the hc reads (~106-137 us each, two a layer, ~125 GB/s), the
+dense GEMVs at 4 columns (180-240 GB/s). After the norm fold and the row-a-lane up kernel the hc read is 62 / 83 / 100
+us at 1 / 4 / 6 tokens (from 88 / 123 / 151 in the morning).
