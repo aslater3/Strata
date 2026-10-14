@@ -212,3 +212,34 @@ bandwidth with the CPU's remaining misses. Estimate: ~85 -> 65-70 ms per round (
 volume, not the recall. Cost: copies into the captured stepped graphs (graph copy nodes beside a spinning kernel gave
 DEVICE_LOST, section 7), device residency updates inside a window, prefetch slots. A multi-day engine feature; not
 started.
+
+## 10. Decode: the VRAM prefetch, built and measured (2026-10-14) - rejected
+
+Built on branch `a770/vram-prefetch` (opt-in `STRATA_VRAM_PREFETCH=<top-k per token>`, `_SLOTS=<experts per layer>`):
+`RouterLookahead` (CS-T, the next layer's router on this layer's MoE input; recall of the out-of-VRAM experts 0.64 /
+0.80 / 0.86 at top-10 / 16 / 20, `STRATA_PREDICT_PROBE=2`) copies its predicted out-of-VRAM experts from the pinned RAM
+copy into a two-layer VRAM ring on its own queue; the next layer's pool plans a miss found there as a VRAM group (the
+hits' own kernel).  First version put them in the PCIe-group list: with `--pcie-mode auto` (the in-graph staging copy,
+16 slots) the extra groups overran staging and the output turned to zeros after 79 tokens; as VRAM groups the output
+is right (ids identical to the baseline in most runs; one run diverged at token 138 by the GPU/CPU rounding the cache
+note describes, no garbage).
+
+Same-day, 8K, `STRATA_PF_XMX=2`, resident RAM, learned24 (baseline 32.53 / 32.56 tok/s decode):
+
+| prefetch (top-k / slots) | decode | GPU wait | pool | CPU misses / layer | used |
+|---|---|---|---|---|---|
+| 16 / 20 | 20.81 | 108.3 | 10.9 | 1.61 | 4.92 of 12.37 |
+| 10 / 6 | 27.06 | 67.9 | 17.9 | 3.45 | 2.96 of 4.77 |
+| 10 / 6, copy kernel | 25.73 | 62.4 | 28.9 | 3.38 | 2.97 of 4.76 |
+| 6 / 3 (x2) | 30.06 / 30.08 | 53.1 | 22.6 | 4.70 | 1.71 of 2.25 |
+| 10 / 6, copies never used | 26.69 | 58.4 | 29.1 | 6.29 | 0 |
+
+It does move the misses off the CPU (pool 24.5 -> 11-23 ms), but the copies themselves - unused - add ~14 ms of GPU
+wait and ~4.6 ms of pool per round at ~220 MB/round (CPU row bandwidth 29.4 -> 24.3 GB/s; the copies run at 14.6
+GB/s, on the copy engine or a copy kernel alike).  Every configuration loses (-8% to -36%).  Same lesson as the
+zero-copy PCIe share (section 7): on this machine host->GPU traffic during decode costs the GPU's critical path more
+than the CPU time it saves.  Not proposed upstream; off by default.
+
+**Decode status:** the measured candidates for an architectural decode change on the A770 - single-graph window,
+spec-split, PCIe zero-copy misses, pre-attention / next-layer VRAM prefetch - all lose.  What remains is per-kernel GPU
+efficiency (no kernel dominates; VRAM hits ~123 GB/s, launch-sized small stages) and a higher hit rate (more VRAM).
