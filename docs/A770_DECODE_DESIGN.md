@@ -314,3 +314,10 @@ prefetch, rows-per-warp and SIMD16 variants, also with large GRF (all slower; th
 
 Engine 8K GPU wait per round: 37.6 (start of section 12) -> 33.7 ms. Deployed (API): warm decode 33.6 -> 37.0 tok/s,
 20K-token prompt 739 -> 746 tok/s prefill, 28.9 -> 33.5 tok/s decode.
+
+**GEMV redesigns tried (2026-10-15, all bitwise, all reverted):** the 1-column kernels in large GRF (kept: Q6_K/Q5_K
+2560-wide +10-14%); a structure-of-arrays Q6_K layout (global and row-local: +10% at 2 columns, slower at 1 / 4 - it
+spilled); R rows a sub-group with the columns one at a time (R = 2: +1-4% at 4 columns on 3 of 5 shapes, slower
+elsewhere; R = 4: 2x slower) - so re-reading the activations per row is not what holds the multi-column GEMVs at
+190-250 GB/s. A hardware-counter profile needs Intel's metrics-discovery libraries (not installed); unitrace
+--metric-list fails without them even with observation_paranoid = 0 (set back to 1).
