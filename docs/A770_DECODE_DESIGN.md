@@ -321,3 +321,10 @@ spilled); R rows a sub-group with the columns one at a time (R = 2: +1-4% at 4 c
 elsewhere; R = 4: 2x slower) - so re-reading the activations per row is not what holds the multi-column GEMVs at
 190-250 GB/s. A hardware-counter profile needs Intel's metrics-discovery libraries (not installed); unitrace
 --metric-list fails without them even with observation_paranoid = 0 (set back to 1).
+
+**Hardware counters (2026-10-15):** Intel's metrics-discovery and metrics-library build in ~/src against a locally
+unpacked libdrm-dev (no system install) and `unitrace --metric-list` then lists ComputeBasic etc., but on this stack
+(xe, Linux 7.0, compute runtime 26.05) neither mode works: the per-kernel query pool fails (`0x78000004`) and the
+time-based streamer will not open (`0x7ffffffe`), also as root with `observation_paranoid = 0` (restored to 1). So the
+GEMV / hc-read / expert kernels below 400 GB/s cannot be stall-profiled here; the 2-row hc-down variant (each slice
+staged once for 128 rows) was 2x slower (16 uint4 a lane spill) and was dropped.
