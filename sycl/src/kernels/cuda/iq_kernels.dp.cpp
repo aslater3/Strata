@@ -4306,7 +4306,16 @@ inline int lanes_env(const char* name) {
     const int n = v ? std::atoi(v) : kExpertLanes;
     return n == 4 || n == 8 || n == 16 || n == 32 ? n : kExpertLanes;
 }
-inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return v; }
+// gate/up lanes a row: 16 by default on Arc A-series (Alchemist). A770, native_grouped_parity --bench2 (2560 x 640, the
+// Coder's formats): gate/up IQ2_S 111.6 -> 104.4, IQ3_XXS 130.7 -> 117.7, IQ3_S 146.7 -> 132.6 us a call (32 lanes:
+// slower again). Another reduction order (a row's sum over 16 lanes instead of 8). STRATA_GU_LANES=4/8/16/32 chooses.
+inline int gu_lanes() {
+    static const int v = [] {
+        if (std::getenv("STRATA_GU_LANES") != nullptr) return lanes_env("STRATA_GU_LANES");
+        return strata::intel_gpu_gen(dpct::get_in_order_queue().get_device()) == strata::IntelGpuGen::Alchemist ? 16 : kExpertLanes;
+    }();
+    return v;
+}
 inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return v; }
 // STRATA_KQ_GU_LANES (opt-in): the lane split of the K-quant / Q8_0 gate/up rows alone (Unsloth's files), default STRATA_GU_LANES.
 // B70, 4-token windows, split on: 16 lanes reads Q4_K/Q5_1 experts at 439 GB/s against 426 at 8; the reduction order differs
