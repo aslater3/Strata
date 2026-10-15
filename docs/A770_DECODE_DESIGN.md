@@ -293,3 +293,24 @@ up 40 us a call in the engine), the GDN recurrence 6.7 ms (step 118 + commit 75 
 
 The GPU cannot be kept busy through the CPU's share while ~24% of the experts are out of VRAM: that share is the
 remaining structural idle, bounded by the card's 16 GB against ~27 GB of experts.
+
+## 13. Toward 400 GB/s per kernel (2026-10-15)
+
+unitrace's device timing inflates small kernels ~3x (gr_bench 64-100 -> 248 us traced), so kernels are judged by
+host-timed benches and the engine's GPU wait. unitrace's compile table (spill bytes per thread) found the real problem:
+several decode kernels spilled at the default 128 registers on SIMD32.
+
+| change | measured | bits |
+|---|---|---|
+| GDN recurrence kernels in large GRF (`STRATA_GDN_LARGE_GRF`; the step kernel spilled 7.6 KB/thread) | gdn_bench 4 / 6 tokens 103 / 114 -> 39.5 / 44.9 us; GPU wait -2.2 ms/round | same |
+| hc down at 256-column slices (`STRATA_GR_DOWN_COLS`) | gr_bench 2-6 tokens -6 to -9%; GPU wait -1.6 ms/round | fp32 order |
+| router top-10 + QSA block top-k in large GRF (`STRATA_SMALL_LARGE_GRF`; 3-12 KB spill) | GPU wait -0.2 ms (noise) | same |
+
+Rejected: `STRATA_QFUSE=1` (broken in the SYCL port: repetitive text, acceptance 0.79 -> 0.70); the Q6_K wide GEMV's
+prefetch, rows-per-warp and SIMD16 variants, also with large GRF (all slower; the GEMVs stay at 190-300 GB/s, 1 column
+~290); a VRAM reserve below 1200 MiB (+3% at 8K, -8% to -50% at 32K: serves stall); 8 dequant superblocks a work-group
+(+0.4%); host flag spinning instead of queue waits (no gain: ~8 us either way). The dequant kernels already move
+257-280 GB/s (IQ3_XXS 174).
+
+Engine 8K GPU wait per round: 37.6 (start of section 12) -> 33.7 ms. Deployed (API): warm decode 33.6 -> 37.0 tok/s,
+20K-token prompt 739 -> 746 tok/s prefill, 28.9 -> 33.5 tok/s decode.
