@@ -2045,13 +2045,11 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_6ae5f0,
-                                            dpct_kernel_scalar<TK_PER>>>(
+        strata::parallel_for_maybe_big<dpct_kernel_name<class block_topk_reg_kernel_6ae5f0,
+                                            dpct_kernel_scalar<TK_PER>>>(strata::q_of(stream),
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),
                                   sycl::range(1, 1, TK_T)),
-                exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
                         block_topk_reg_kernel<TK_PER>(scores, steps, max_blocks,
@@ -2067,13 +2065,11 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_10a848,
-                                            dpct_kernel_scalar<TK_PER_MAX>>>(
+        strata::parallel_for_maybe_big<dpct_kernel_name<class block_topk_reg_kernel_10a848,
+                                            dpct_kernel_scalar<TK_PER_MAX>>>(strata::q_of(stream),
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),
                                   sycl::range(1, 1, TK_T)),
-                exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
                         block_topk_reg_kernel<TK_PER_MAX>(scores, steps,

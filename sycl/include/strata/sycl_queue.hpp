@@ -384,3 +384,28 @@ inline bool free_device_segmented(void* p, sycl::queue& q) {
     return true;
 }
 }  // namespace strata
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+namespace strata {
+// Large-GRF mode for small decode kernels that spill at 128 registers on Arc A-series (Alchemist): the router top-10,
+// QSA's block top-k (unitrace on the A770: 3-12 KB of spill a SIMD32 thread). The same arithmetic (bitwise).
+// STRATA_SMALL_LARGE_GRF=1 forces it on, =0 off.
+inline bool small_kernels_large_grf(sycl::queue* q) {
+    static const bool v = [q] {
+        const char* e = std::getenv("STRATA_SMALL_LARGE_GRF");
+        if (e != nullptr) return std::atoi(e) != 0;
+        return intel_gpu_gen(q->get_device()) == IntelGpuGen::Alchemist;
+    }();
+    return v;
+}
+struct big_grf_kernel_tag;
+template <class Name, class R, class F>
+void parallel_for_maybe_big(sycl::queue* q, R range, F f) {
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (small_kernels_large_grf(q))
+        q->parallel_for<dpct_kernel_name<big_grf_kernel_tag, Name>>(
+            range, sx::properties{sx::use_root_sync, sycl::ext::intel::experimental::grf_size<256>}, f);
+    else
+        q->parallel_for<Name>(range, sx::properties{sx::use_root_sync}, f);
+}
+}  // namespace strata

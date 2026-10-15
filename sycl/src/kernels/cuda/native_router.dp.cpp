@@ -273,8 +273,7 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     // SYCL port: one block per token running the single-token route<512> (the same kernel as the 256-expert multi
     // launch below).  Upstream's one-warp-per-token route_multi gives the same bits (native_multi_parity checks
     // that) but hung an Arc A750 (Alchemist) on its first launch.
-    ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class route_512_multi>>(
+    strata::parallel_for_maybe_big<dpct_kernel_name<class route_512_multi>>(((sycl::queue *)(strata::q_of(stream))),
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<512>(logits, ids, weights); });
     /*
@@ -304,8 +303,7 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
     if (!stream || n_tok < 1 || n_expert != 256 || !valid(logits, (size_t) n_tok * 256 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi, 256): a stream, 256 experts and aligned [n,256]/[n,10] buffers");
-    ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class route_256_multi>>(
+    strata::parallel_for_maybe_big<dpct_kernel_name<class route_256_multi>>(((sycl::queue *)(strata::q_of(stream))),
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
 }
